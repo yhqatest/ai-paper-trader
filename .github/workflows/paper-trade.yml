@@ -1,0 +1,60 @@
+# AI paper trading every 30 minutes: Claude reads Bitget market data (paper/market.js), decides, and places
+# simulated orders through paper/trade.js. State and the decision log live on the `paper` branch.
+# See paper/prompt.md. The dashboard is paper.html on chickenstock-xi.vercel.app (repo yinghui02/t-monitor).
+# GitHub drops many scheduled runs, so the beat comes from outside: cron-job.org (and a Mac launchd
+# job) call t-monitor's api/paper-tick.js, which dispatches this workflow. The cron below is a
+# fallback; a scheduled run skips itself if the bot already decided within the last 25 minutes.
+# This repo is public so Actions minutes are free. Secret: CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`).
+name: paper-trade
+on:
+  schedule:
+    - cron: '10,40 * * * *'
+  workflow_dispatch:
+concurrency: paper-trade
+permissions:
+  contents: write
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Check out the paper branch into state/
+        run: |
+          if git ls-remote --exit-code origin paper >/dev/null; then
+            git fetch -q origin paper && git worktree add -q state origin/paper
+          else
+            git worktree add -q --detach state && git -C state checkout -q --orphan paper && git -C state rm -rfq .
+          fi
+      - name: Skip if the bot decided recently
+        id: due
+        run: |
+          last=$(tail -1 state/log.jsonl 2>/dev/null | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")||"{}").time||0')
+          age=$(node -pe "Math.round((Date.now() - new Date('$last')) / 60000)")
+          echo "Last decision ${age} min ago"
+          if [ "${{ github.event_name }}" = schedule ] && [ "$age" -lt 25 ]; then echo run=false >> "$GITHUB_OUTPUT"; else echo run=true >> "$GITHUB_OUTPUT"; fi
+      - run: npm install -g @anthropic-ai/claude-code
+        if: steps.due.outputs.run == 'true'
+      - name: Claude trades
+        if: steps.due.outputs.run == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          STATE_DIR: ${{ github.workspace }}/state
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          claude -p "$(cat paper/prompt.md)" --model opus \
+            --allowedTools "Bash(node paper/market.js:*)" "Bash(node paper/trade.js:*)" "WebSearch" "WebFetch" | tee claude.log
+      - name: Save state
+        if: steps.due.outputs.run == 'true'
+        run: |
+          SUMMARY=$(grep -v '^[[:space:]]*$' claude.log | tail -1)
+          cd state
+          git config user.name yhqatest
+          git config user.email 288525779+yhqatest@users.noreply.github.com
+          git add -A
+          git commit -qm "Paper trade: $SUMMARY" || exit 0
+          git push -q origin HEAD:paper
+          echo "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
