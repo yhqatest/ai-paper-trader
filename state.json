@@ -1,9 +1,13 @@
 {
-  "cash": 800,
+  "cash": 700,
   "positions": {
     "SOLUSDT": {
       "qty": 2.66613290632506,
       "cost": 200
+    },
+    "COLLECTUSDT": {
+      "qty": 3741.012582384662,
+      "cost": 100
     }
   },
   "started": "2026-11-18T04:48:03.728Z"
