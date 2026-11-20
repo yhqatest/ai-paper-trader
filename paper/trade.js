@@ -9,7 +9,8 @@
 //   node paper/trade.js stops SYMBOL STOP TAKE "reason"                        (moves stop-loss / take-profit)
 // Decisions:
 //   node paper/trade.js hold "reason"                      (records a no-trade decision)
-//   node paper/trade.js gold "view"                        (records this hour's view on gold, shown on paper.html)
+//   node paper/trade.js gold buy|watch|sell "view"         (records this run's view on gold, shown on paper.html;
+//                                                           buy = a buy setup is here now, sell = bearish / would sell)
 // Enforces the rules: liquid coins only, ≤30% of portfolio per coin (futures: by margin), futures margin ≤50% in
 // total, leverage ≤5x, a stop-loss on every futures position that sits before the liquidation price, ≤3 trades
 // per run. Futures stops, take-profits, funding and liquidation are applied by settleFutures (lib.js) every run.
@@ -18,13 +19,15 @@ const {FEE, MIN_VOLUME, MAX_WEIGHT, MAX_TRADES_PER_RUN, FUT_FEE, MIN_FUT_VOLUME,
 
 const fail = msg => { console.error('REJECTED: ' + msg); process.exit(1); };
 const TRADES = ['buy', 'sell', 'long', 'short', 'close'];
-const USAGE = '用法: buy SYMBOL USDT "reason" | sell SYMBOL PERCENT "reason" | long/short SYMBOL MARGIN LEVERAGE STOP TAKE "reason" | close SYMBOL PERCENT "reason" | stops SYMBOL STOP TAKE "reason" | hold "reason" | gold "view"';
+const USAGE = '用法: buy SYMBOL USDT "reason" | sell SYMBOL PERCENT "reason" | long/short SYMBOL MARGIN LEVERAGE STOP TAKE "reason" | close SYMBOL PERCENT "reason" | stops SYMBOL STOP TAKE "reason" | hold "reason" | gold buy|watch|sell "view"';
 
 (async () => {
   const [action, ...args] = process.argv.slice(2);
   if (action === 'hold' || action === 'gold') {
+    const stance = action === 'gold' ? args.shift() : undefined;
+    if (action === 'gold' && !['buy', 'watch', 'sell'].includes(stance)) fail('用法: gold buy|watch|sell "view"');
     if (!args[0]) fail('需要理由');
-    appendLog({action, reason: args[0]});
+    appendLog({action, stance, reason: args[0]});
     return console.log(`OK ${action} recorded`);
   }
   const symbol = args[0];
