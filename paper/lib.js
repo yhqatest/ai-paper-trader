@@ -11,7 +11,7 @@ const STATE = path.join(DIR, 'state.json');
 const LOG = path.join(DIR, 'log.jsonl');
 const START_CASH = 1000;      // virtual USDT
 const FEE = 0.001;            // Bitget spot taker fee
-const MIN_VOLUME = 1e6;       // only coins with ≥1M USDT traded in 24h (≈40 coins)
+const MIN_VOLUME = 1e7;       // only coins with ≥10M USDT traded in 24h, which keeps out thin small caps
 const MAX_WEIGHT = 0.3;       // one coin ≤30% of portfolio value
 const MAX_TRADES_PER_RUN = 3;
 // Futures: USDT-M perpetuals, isolated margin, one position per coin.
@@ -20,6 +20,12 @@ const MIN_FUT_VOLUME = 1e7;   // futures contracts with ≥10M USDT traded in 24
 const MAX_LEVERAGE = 5;
 const MAX_FUT_MARGIN = 0.5;   // all futures margin together ≤50% of portfolio value
 const MMR = 0.005;            // maintenance margin rate used for the liquidation price
+// Risk rules, partly from JakeNesler/Claude_Prophet's TRADING_RULES.md (the owner asked to learn from it).
+const RISK_PER_TRADE = 0.015; // a stopped-out entry loses ≤1.5% of the portfolio (half that after a losing streak)
+const LOSS_STREAK = 3;        // this many losing exits in a row halves the risk until a win
+const MIN_REWARD_RISK = 1.5;  // take-profit distance ≥1.5× the stop distance
+const ATR_STOP = 1.5;         // stop ≥1.5× the coin's average hourly range away, so normal swings don't hit it
+const DAILY_LOSS_STOP = 0.05; // no new entries once the portfolio is 5% below where it started the day (UTC+8)
 const GOLD = 'XAUTUSDT';      // Tether Gold, 1 token = 1 troy oz; the owner wants gold watched every run
 
 function loadState() {
@@ -74,12 +80,58 @@ async function recentChanges(symbols) {
   return out;
 }
 
+// Average hourly true range over the last 24 hours, spot or perpetual candles.
+async function hourlyAtr(symbol, futures) {
+  const k = await bitget(futures ? `/api/v2/mix/market/candles?symbol=${symbol}&productType=USDT-FUTURES&granularity=1H&limit=25`
+    : `/api/v2/spot/market/candles?symbol=${symbol}&granularity=1h&limit=25`);
+  const c = k.sort((a, b) => a[0] - b[0]).map(x => x.slice(1, 5).map(Number));
+  const tr = c.slice(1).map(([, h, l], i) => Math.max(h - l, Math.abs(h - c[i][3]), Math.abs(l - c[i][3])));
+  return tr.reduce((a, b) => a + b, 0) / tr.length;
+}
+
+// BTC's daily trend: down = below a falling 20-day average, up = above a rising one, otherwise sideways.
+async function btcTrend() {
+  const c = (await bitget('/api/v2/spot/market/candles?symbol=BTCUSDT&granularity=1day&limit=30')).sort((a, b) => a[0] - b[0]).map(k => +k[4]);
+  const sma = end => c.slice(end - 20, end).reduce((a, b) => a + b, 0) / 20;
+  const close = c.at(-1), now = sma(c.length), before = sma(c.length - 5);
+  const trend = close < now && now < before ? 'down' : close > now && now > before ? 'up' : 'sideways';
+  return {trend, close, sma20: now, sma20Before: before};
+}
+
+// The bot's record from its exits (spot sells, futures closes, liquidations): win rate, average win and loss,
+// and how many losses in a row it ended on.
+function record(log) {
+  const exits = log.filter(e => ['sell', 'close', 'liquidated'].includes(e.action) && e.pnl != null);
+  const wins = exits.filter(e => e.pnl > 0), losses = exits.filter(e => e.pnl <= 0), avg = a => a.length ? a.reduce((t, e) => t + e.pnl, 0) / a.length : 0;
+  let streak = 0;
+  for (let i = exits.length - 1; i >= 0 && exits[i].pnl <= 0; i--) streak++;
+  return {exits, wins: wins.length, losses: losses.length, avgWin: avg(wins), avgLoss: avg(losses), total: exits.reduce((t, e) => t + e.pnl, 0), streak};
+}
+
+// Where the portfolio stood when today (UTC+8) began, recorded the first time it's asked for each day.
+function dayStart(state, total) {
+  const date = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
+  if (state.day?.date !== date) state.day = {date, total};
+  return state.day;
+}
+
 // BTC price at a past moment (the close of that minute), for the buy-and-hold benchmark.
 async function btcAt(time) {
   const t = Date.parse(time);
   const c = await bitget(`/api/v2/spot/market/history-candles?symbol=BTCUSDT&granularity=1min&endTime=${t + 60000}&limit=2`);
   const k = c.filter(k => +k[0] <= t).pop() || c[0];
   return +k[4];
+}
+
+// A spot position: {qty, cost, stop, take, checked}. Positions bought before stops existed have none.
+// Sells `frac` of a spot position at `price` and logs it; extra = {reason, trigger?}.
+function sellSpot(state, symbol, frac, price, extra) {
+  const p = state.positions[symbol], qty = p.qty * frac, gross = qty * price, cost = p.cost * frac, back = gross * (1 - FEE);
+  state.cash += back;
+  if (frac >= 1) delete state.positions[symbol];
+  else Object.assign(p, {qty: p.qty - qty, cost: p.cost - cost});
+  appendLog({action: 'sell', symbol, price, qty, usdt: back, fee: gross * FEE, pnl: back - cost, ...extra});
+  return {qty, back, pnl: back - cost};
 }
 
 // A futures position: {side: 'long'|'short', qty, entry, margin, cost (margin + opening fee), leverage, stop, take,
@@ -102,12 +154,27 @@ function closeFutures(state, symbol, frac, price, extra) {
   return {back, pnl: back - cost};
 }
 
-// Catches futures positions up with what happened since they were last checked: funding settlements, then
-// stop-loss / take-profit / liquidation against 1-minute candles (15-minute when the gap is over 1000 minutes),
-// in time order. Within one candle the stop counts before the take-profit. Times in log reasons are UTC+8.
-// Returns lines describing what happened.
-async function settleFutures(state) {
+// Catches positions up with what happened since they were last checked, against 1-minute candles (15-minute
+// when the gap is over 1000 minutes), in time order: spot stop-loss / take-profit, and for futures funding
+// settlements, stop-loss / take-profit and liquidation. Within one candle the stop counts before the take-profit.
+// Times in log reasons are UTC+8. Returns lines describing what happened.
+const utc8 = ms => new Date(ms + 8 * 3600000).toISOString().slice(5, 16).replace('T', ' ');
+async function settle(state) {
   const out = [], now = Date.now();
+  for (const [symbol, p] of Object.entries(state.positions)) {
+    if (!p.stop || !p.checked) continue;
+    const from = Date.parse(p.checked);
+    const candles = await bitget(`/api/v2/spot/market/candles?symbol=${symbol}&granularity=${now - from > 1000 * 60000 ? '15min' : '1min'}&startTime=${from}&endTime=${now}&limit=1000`);
+    p.checked = new Date(now).toISOString();
+    for (const k of candles.sort((a, b) => a[0] - b[0])) {
+      const [high, low] = [+k[2], +k[3]];
+      const hit = low <= p.stop ? ['stop', p.stop, '止损'] : p.take && high >= p.take ? ['take', p.take, '止盈'] : null;
+      if (!hit) continue;
+      const r = sellSpot(state, symbol, 1, hit[1], {trigger: hit[0], reason: `${utc8(+k[0])} 触发${hit[2]} ${hit[1]}`});
+      out.push(`${symbol} spot ${hit[0] === 'stop' ? 'stop-loss' : 'take-profit'} hit at ${hit[1]} (${utc8(+k[0])}), pnl ${r.pnl.toFixed(2)} USDT`);
+      break;
+    }
+  }
   for (const [symbol, p] of Object.entries(state.futures)) {
     const from = Date.parse(p.checked);
     const [rates, candles] = await Promise.all([
@@ -127,7 +194,7 @@ async function settleFutures(state) {
       fund(+k[0]);
       const [high, low] = [+k[2], +k[3]], liq = liqPrice(p), long = p.side === 'long';
       const hit = level => long ? low <= level : high >= level, nearer = (a, b) => long ? Math.max(a, b) : Math.min(a, b);
-      const at = new Date(+k[0] + 8 * 3600000).toISOString().slice(5, 16).replace('T', ' ');
+      const at = utc8(+k[0]);
       if (hit(nearer(p.stop, liq))) {
         if (nearer(p.stop, liq) === p.stop) {
           const r = closeFutures(state, symbol, 1, p.stop, {trigger: 'stop', reason: `${at} 触发止损 ${p.stop}`});
@@ -154,7 +221,7 @@ async function settleFutures(state) {
 function value(state, tk, ftk = {}) {
   const positions = Object.entries(state.positions).map(([sym, p]) => {
     const price = +(tk[sym]?.bidPr || tk[sym]?.lastPr || 0);
-    return {symbol: sym, qty: p.qty, cost: p.cost, price, value: p.qty * price, pnlPct: p.cost ? (p.qty * price / p.cost - 1) * 100 : 0};
+    return {symbol: sym, qty: p.qty, cost: p.cost, price, value: p.qty * price, pnlPct: p.cost ? (p.qty * price / p.cost - 1) * 100 : 0, stop: p.stop, take: p.take};
   });
   const futures = Object.entries(state.futures || {}).map(([sym, p]) => {
     const price = +(ftk[sym]?.lastPr || p.entry), value = equity(p, price);
@@ -166,4 +233,6 @@ function value(state, tk, ftk = {}) {
 }
 
 module.exports = {GOLD, START_CASH, FEE, MIN_VOLUME, MAX_WEIGHT, MAX_TRADES_PER_RUN, FUT_FEE, MIN_FUT_VOLUME, MAX_LEVERAGE, MAX_FUT_MARGIN,
-  loadState, saveState, readLog, appendLog, bitget, tickers, futuresTickers, recentChanges, btcAt, liqPrice, closeFutures, settleFutures, value};
+  RISK_PER_TRADE, LOSS_STREAK, MIN_REWARD_RISK, ATR_STOP, DAILY_LOSS_STOP,
+  loadState, saveState, readLog, appendLog, bitget, tickers, futuresTickers, recentChanges, hourlyAtr, btcTrend, record, dayStart, btcAt,
+  liqPrice, sellSpot, closeFutures, settle, value};

@@ -1,8 +1,11 @@
 // What the AI trader looks at each run.
-//   node paper/market.js           → settles futures (funding, stops, liquidation), then portfolio, recent decisions,
+//   node paper/market.js           → settles positions (stops, take-profits, funding, liquidation), then BTC's daily
+//                                    trend, portfolio, today's P&L, your track record and risk budget, recent decisions,
 //                                    BTC/ETH/gold, top movers (1h, 4h, 24h) and volume among liquid coins, futures funding
-//   node paper/market.js SOLUSDT   → that coin's 24h stats, its perpetual (mark, funding), last 48 hourly and 30 daily candles
-const {GOLD, MIN_VOLUME, MIN_FUT_VOLUME, START_CASH, loadState, saveState, readLog, bitget, tickers, futuresTickers, recentChanges, settleFutures, value} = require('./lib');
+//   node paper/market.js SOLUSDT   → that coin's 24h stats, hourly range (for the stop), its perpetual (mark, funding),
+//                                    last 48 hourly and 30 daily candles
+const {GOLD, MIN_VOLUME, MIN_FUT_VOLUME, START_CASH, RISK_PER_TRADE, LOSS_STREAK, MIN_REWARD_RISK, ATR_STOP, DAILY_LOSS_STOP,
+  loadState, saveState, readLog, bitget, tickers, futuresTickers, recentChanges, hourlyAtr, btcTrend, record, dayStart, settle, value} = require('./lib');
 
 const pct = (v, d = 2) => `${(+v * 100).toFixed(d)}%`;
 let ch = {};
@@ -18,6 +21,8 @@ const row = t => `${t.symbol.padEnd(14)} last ${t.lastPr}  1h ${ch[t.symbol] ? p
       ch = await recentChanges([sym]);
       console.log(row(t), `\nhigh24 ${t.high24h} low24 ${t.low24h} bid ${t.bidPr} ask ${t.askPr}`);
     } else console.log(`${sym}: no spot pair, perpetual only`);
+    const atr = await hourlyAtr(sym, !t), last = +(t || f).lastPr;
+    console.log(`average hourly range (24h) ${atr.toPrecision(4)} = ${(atr / last * 100).toFixed(2)}% → stop at least ${(ATR_STOP * atr).toPrecision(4)} (${(ATR_STOP * atr / last * 100).toFixed(2)}%) away, take-profit at least ${MIN_REWARD_RISK}× the stop distance`);
     console.log(f ? `perpetual: last ${f.lastPr} mark ${f.markPrice} bid ${f.bidPr} ask ${f.askPr} funding ${pct(f.fundingRate, 4)}/period vol ${(+f.usdtVolume / 1e6).toFixed(1)}M USDT${+f.usdtVolume < MIN_FUT_VOLUME ? ' (too thin to trade)' : ''}` : 'perpetual: none');
     if (!t) return;
     const candles = await bitget(`/api/v2/spot/market/candles?symbol=${sym}&granularity=1h&limit=48`);
@@ -28,17 +33,24 @@ const row = t => `${t.symbol.padEnd(14)} last ${t.lastPr}  1h ${ch[t.symbol] ? p
     daily.forEach(c => console.log(new Date(+c[0] + 8 * 3600000).toISOString().slice(0, 10), c[1], c[2], c[3], c[4], c[5]));
     return;
   }
-  const state = loadState(), settled = await settleFutures(state);
-  saveState(state);
+  const state = loadState(), settled = await settle(state);
   if (settled.length) console.log(`== Since your last run\n${settled.map(l => '  ' + l).join('\n')}\n`);
-  const v = value(state, tk, ftk);
+  const v = value(state, tk, ftk), day = dayStart(state, v.total), btc = await btcTrend();
+  saveState(state);
+  console.log(`== BTC daily trend: ${btc.trend.toUpperCase()} (close ${btc.close}, 20-day average ${btc.sma20.toFixed(0)}, 5 days ago ${btc.sma20Before.toFixed(0)})${btc.trend === 'down' ? '\n   → buys and longs are blocked (gold excepted). Short weak coins or wait.' : ''}\n`);
   console.log(`== Portfolio (${new Date().toISOString()})\ntotal ${v.total.toFixed(2)} USDT (start ${START_CASH}, ${((v.total / START_CASH - 1) * 100).toFixed(2)}%), cash ${v.cash.toFixed(2)}`);
   v.positions.forEach(p => console.log(`  spot ${p.symbol} qty ${p.qty} value ${p.value.toFixed(2)} cost ${p.cost.toFixed(2)} pnl ${p.pnlPct.toFixed(2)}%`));
   v.futures.forEach(f => console.log(`  ${f.side.toUpperCase()} ${f.symbol} ${f.leverage}x qty ${f.qty} entry ${f.entry} now ${f.price} equity ${f.value.toFixed(2)} cost ${f.cost.toFixed(2)} pnl ${f.pnlPct.toFixed(2)}% stop ${f.stop} take ${f.take} liquidation ${f.liq.toPrecision(6)} funding paid ${f.funding.toFixed(4)}`));
+  const today = v.total / day.total - 1;
+  console.log(`today (UTC+8 ${day.date}) ${(today * 100).toFixed(2)}% from ${day.total.toFixed(2)}${today <= -DAILY_LOSS_STOP ? ' → DAILY LOSS LIMIT HIT, no new entries today' : ''}`);
+  const rec = record(readLog()), budget = v.total * RISK_PER_TRADE * (rec.streak >= LOSS_STREAK ? 0.5 : 1);
+  console.log(`\n== Your track record (${rec.exits.length} exits)\nwins ${rec.wins}, losses ${rec.losses}${rec.exits.length ? `, win rate ${(rec.wins / rec.exits.length * 100).toFixed(0)}%` : ''}, average win ${rec.avgWin.toFixed(2)}, average loss ${rec.avgLoss.toFixed(2)}, total ${rec.total.toFixed(2)} USDT, current losing streak ${rec.streak}`);
+  rec.exits.slice(-10).forEach(e => console.log(`  ${e.time.slice(0, 16)} ${e.action}${e.trigger ? '(' + e.trigger + ')' : ''} ${e.symbol}${e.side ? ' ' + e.side : ''} pnl ${e.pnl.toFixed(2)} — ${e.reason.slice(0, 80)}`));
+  console.log(`risk budget per entry: ${budget.toFixed(2)} USDT if the stop is hit${rec.streak >= LOSS_STREAK ? ` (halved: ${rec.streak} losses in a row)` : ''}`);
   console.log('\n== Your last 10 decisions');
   readLog().filter(e => e.action !== 'gold').slice(-10).forEach(e => console.log(`  ${e.time.slice(0, 16)} ${e.action} ${e.symbol || ''}${e.leverage ? ' ' + e.leverage + 'x' : ''} ${e.usdt ? e.usdt.toFixed(2) + ' USDT' : ''}${e.pnl != null ? ' pnl ' + e.pnl.toFixed(2) : ''} — ${e.reason}`));
   const liquid = Object.values(tk).filter(t => +t.usdtVolume >= MIN_VOLUME);
-  ch = await recentChanges([...new Set([...liquid.map(t => t.symbol), ...Object.keys(state.positions), GOLD])]);
+  ch = await recentChanges([...new Set([...liquid.map(t => t.symbol), ...Object.keys(state.positions), GOLD, 'BTCUSDT', 'ETHUSDT'])]);
   const h4 = t => ch[t.symbol]?.h4 ?? 0;
   console.log(`\n== Majors and gold (${GOLD} = 1 oz of gold)\n${['BTCUSDT', 'ETHUSDT', GOLD].filter(s => tk[s]).map(s => row(tk[s])).join('\n')}`);
   const by = (key, dir) => liquid.slice().sort((a, b) => dir * (key(b) - key(a))).slice(0, 10).map(row).join('\n');
