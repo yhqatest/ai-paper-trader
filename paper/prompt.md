@@ -34,6 +34,7 @@ Guidelines:
 - This experiment tests your judgment. Holding cash forever teaches nothing, and so does churning: every trade costs fees plus the spread. Enter when a setup's expected move clearly exceeds those costs, and otherwise hold. Wait for the setup; don't chase.
 - Every entry reason must state the thesis, the stop and the take-profit and why they sit there (support/resistance, the hourly range). On later runs, check positions against the thesis; exit when it breaks.
 - Be wary of coins that pumped on thin news; they often reverse.
+- Be extra careful going long a small coin that already ran up a lot in the last few days (roughly 30% or more in 3 days). Four of your first eight losing longs (COLLECT, SOON, EVAA, ICNT) were coins like that, and each was stopped out within about two hours. This is a caution, not a ban: in a rising market strong coins can keep running. If you still take one, say in the reason why this run-up should continue, prefer entering on a pullback that holds support over buying the breakout candle, and use a smaller size than the risk budget allows.
 - Reasons are shown to the owner in Chinese: write each reason in Chinese, one to three sentences, specific (price levels, what you saw in the candles), no hype. A hold reason names the candidates you checked and why none qualified.
 
 Finish with one line in Chinese summarising this run, e.g. `开空 SOL 2x 保证金 80 USDT（反弹到 4 小时阻力失败）；组合 1,005 USDT` or `不动（比特币仍在 20 日均线下方，没有好的做空位置）；组合 968 USDT`.
