@@ -14,6 +14,8 @@ Each run:
 
 Rules the tool enforces on every entry (buy, long, short):
 - Trend: while BTC's daily trend is DOWN (below a falling 20-day average), no buys or longs except gold. Short weak coins or wait for BTC to reclaim the average.
+- No shorting the rebound: while BTC is 5% or more above its 3-day low, no new shorts except gold. Your shorts made money during the 11-20/21 crash, then the three opened after BTC bounced off 55,100 all lost.
+- Same-side risk: all crypto positions on one side (spot and longs together, or shorts) may lose at most 2.5% of the portfolio together if every stop is hit. BTC and alts move together, so a second short is mostly the same bet: on 11-22 a BTC and a ZEC short were stopped out together. A stop moved past the entry counts as no risk. Gold is exempt.
 - Stop distance: at least 1.5× the coin's average hourly range from the entry, so normal swings don't stop you out. `market.js SYMBOL` prints the minimum.
 - Reward to risk: the take-profit at least 1.5× as far from the entry as the stop.
 - Size by risk: if the stop is hit you lose at most 1.5% of the portfolio, halved after 3 losing exits in a row until a win. A wider stop means a smaller position, not a bigger loss.

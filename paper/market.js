@@ -4,8 +4,8 @@
 //                                    BTC/ETH/gold, top movers (1h, 4h, 24h) and volume among liquid coins, futures funding
 //   node paper/market.js SOLUSDT   → that coin's 24h stats, hourly range (for the stop), its perpetual (mark, funding),
 //                                    last 48 hourly and 30 daily candles
-const {GOLD, MIN_VOLUME, MIN_FUT_VOLUME, START_CASH, RISK_PER_TRADE, LOSS_STREAK, MIN_REWARD_RISK, ATR_STOP, DAILY_LOSS_STOP,
-  loadState, saveState, readLog, bitget, tickers, futuresTickers, recentChanges, hourlyAtr, btcTrend, record, dayStart, settle, value} = require('./lib');
+const {GOLD, MIN_VOLUME, MIN_FUT_VOLUME, START_CASH, RISK_PER_TRADE, LOSS_STREAK, MIN_REWARD_RISK, ATR_STOP, DAILY_LOSS_STOP, SIDE_RISK, BOUNCE_NO_SHORT,
+  loadState, saveState, readLog, bitget, tickers, futuresTickers, recentChanges, hourlyAtr, btcTrend, record, dayStart, openRisk, settle, value} = require('./lib');
 
 const pct = (v, d = 2) => `${(+v * 100).toFixed(d)}%`;
 let ch = {};
@@ -37,7 +37,8 @@ const row = t => `${t.symbol.padEnd(14)} last ${t.lastPr}  1h ${ch[t.symbol] ? p
   if (settled.length) console.log(`== Since your last run\n${settled.map(l => '  ' + l).join('\n')}\n`);
   const v = value(state, tk, ftk), day = dayStart(state, v.total), btc = await btcTrend();
   saveState(state);
-  console.log(`== BTC daily trend: ${btc.trend.toUpperCase()} (close ${btc.close}, 20-day average ${btc.sma20.toFixed(0)}, 5 days ago ${btc.sma20Before.toFixed(0)})${btc.trend === 'down' ? '\n   → buys and longs are blocked (gold excepted). Short weak coins or wait.' : ''}\n`);
+  console.log(`== BTC daily trend: ${btc.trend.toUpperCase()} (close ${btc.close}, 20-day average ${btc.sma20.toFixed(0)}, 5 days ago ${btc.sma20Before.toFixed(0)})${btc.trend === 'down' ? '\n   → buys and longs are blocked (gold excepted). Short weak coins or wait.' : ''}`);
+  console.log(`   BTC is ${(btc.bounce * 100).toFixed(1)}% above its 3-day low ${btc.low3}${btc.bounce >= BOUNCE_NO_SHORT ? `\n   → new shorts are blocked (gold excepted) until BTC is within ${BOUNCE_NO_SHORT * 100}% of its 3-day low` : ''}\n`);
   console.log(`== Portfolio (${new Date().toISOString()})\ntotal ${v.total.toFixed(2)} USDT (start ${START_CASH}, ${((v.total / START_CASH - 1) * 100).toFixed(2)}%), cash ${v.cash.toFixed(2)}`);
   v.positions.forEach(p => console.log(`  spot ${p.symbol} qty ${p.qty} value ${p.value.toFixed(2)} cost ${p.cost.toFixed(2)} pnl ${p.pnlPct.toFixed(2)}%`));
   v.futures.forEach(f => console.log(`  ${f.side.toUpperCase()} ${f.symbol} ${f.leverage}x qty ${f.qty} entry ${f.entry} now ${f.price} equity ${f.value.toFixed(2)} cost ${f.cost.toFixed(2)} pnl ${f.pnlPct.toFixed(2)}% stop ${f.stop} take ${f.take} liquidation ${f.liq.toPrecision(6)} funding paid ${f.funding.toFixed(4)}`));
@@ -47,6 +48,8 @@ const row = t => `${t.symbol.padEnd(14)} last ${t.lastPr}  1h ${ch[t.symbol] ? p
   console.log(`\n== Your track record (${rec.exits.length} exits)\nwins ${rec.wins}, losses ${rec.losses}${rec.exits.length ? `, win rate ${(rec.wins / rec.exits.length * 100).toFixed(0)}%` : ''}, average win ${rec.avgWin.toFixed(2)}, average loss ${rec.avgLoss.toFixed(2)}, total ${rec.total.toFixed(2)} USDT, current losing streak ${rec.streak}`);
   rec.exits.slice(-10).forEach(e => console.log(`  ${e.time.slice(0, 16)} ${e.action}${e.trigger ? '(' + e.trigger + ')' : ''} ${e.symbol}${e.side ? ' ' + e.side : ''} pnl ${e.pnl.toFixed(2)} — ${e.reason.slice(0, 80)}`));
   console.log(`risk budget per entry: ${budget.toFixed(2)} USDT if the stop is hit${rec.streak >= LOSS_STREAK ? ` (halved: ${rec.streak} losses in a row)` : ''}`);
+  const open = openRisk(state), cap = v.total * SIDE_RISK;
+  console.log(`same-side cap ${cap.toFixed(2)} USDT (${SIDE_RISK * 100}%, gold excepted): longs already risk ${open.long.toFixed(2)}, shorts ${open.short.toFixed(2)} → room for ${Math.max(0, cap - open.long).toFixed(2)} more long risk, ${Math.max(0, cap - open.short).toFixed(2)} more short risk`);
   console.log('\n== Your last 10 decisions');
   readLog().filter(e => e.action !== 'gold').slice(-10).forEach(e => console.log(`  ${e.time.slice(0, 16)} ${e.action} ${e.symbol || ''}${e.leverage ? ' ' + e.leverage + 'x' : ''} ${e.usdt ? e.usdt.toFixed(2) + ' USDT' : ''}${e.pnl != null ? ' pnl ' + e.pnl.toFixed(2) : ''} — ${e.reason}`));
   const liquid = Object.values(tk).filter(t => +t.usdtVolume >= MIN_VOLUME);

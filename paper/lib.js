@@ -26,6 +26,8 @@ const LOSS_STREAK = 3;        // this many losing exits in a row halves the risk
 const MIN_REWARD_RISK = 1.5;  // take-profit distance ≥1.5× the stop distance
 const ATR_STOP = 1.5;         // stop ≥1.5× the coin's average hourly range away, so normal swings don't hit it
 const DAILY_LOSS_STOP = 0.05; // no new entries once the portfolio is 5% below where it started the day (UTC+8)
+const SIDE_RISK = 0.025;      // all crypto positions on one side together lose ≤2.5% if every stop is hit (BTC and alts move together)
+const BOUNCE_NO_SHORT = 0.05; // no new crypto shorts while BTC is ≥5% above its 3-day low: shorts into the rebound after a crash kept failing
 const GOLD = 'XAUTUSDT';      // Tether Gold, 1 token = 1 troy oz; the owner wants gold watched every run
 
 function loadState() {
@@ -90,12 +92,14 @@ async function hourlyAtr(symbol, futures) {
 }
 
 // BTC's daily trend: down = below a falling 20-day average, up = above a rising one, otherwise sideways.
+// bounce = how far BTC is above the lowest low of the last 3 daily candles (today included).
 async function btcTrend() {
-  const c = (await bitget('/api/v2/spot/market/candles?symbol=BTCUSDT&granularity=1day&limit=30')).sort((a, b) => a[0] - b[0]).map(k => +k[4]);
+  const k = (await bitget('/api/v2/spot/market/candles?symbol=BTCUSDT&granularity=1day&limit=30')).sort((a, b) => a[0] - b[0]), c = k.map(x => +x[4]);
   const sma = end => c.slice(end - 20, end).reduce((a, b) => a + b, 0) / 20;
   const close = c.at(-1), now = sma(c.length), before = sma(c.length - 5);
   const trend = close < now && now < before ? 'down' : close > now && now > before ? 'up' : 'sideways';
-  return {trend, close, sma20: now, sma20Before: before};
+  const low3 = Math.min(...k.slice(-3).map(x => +x[3]));
+  return {trend, close, sma20: now, sma20Before: before, low3, bounce: close / low3 - 1};
 }
 
 // The bot's record from its exits (spot sells, futures closes, liquidations): win rate, average win and loss,
@@ -142,6 +146,15 @@ function liqPrice(p) {
   return p.side === 'long' ? (p.entry * p.qty - p.margin) / (p.qty * (1 - MMR)) : (p.entry * p.qty + p.margin) / (p.qty * (1 + MMR));
 }
 const equity = (p, price) => Math.max(0, p.margin + dir(p) * (price - p.entry) * p.qty);
+
+// What the open crypto positions would lose if every stop were hit, by side; gold is left out since it doesn't move
+// with BTC. A stop already past the entry has locked in a gain and counts as 0.
+function openRisk(state) {
+  const r = {long: 0, short: 0};
+  for (const [sym, p] of Object.entries(state.positions)) if (sym !== GOLD && p.stop) r.long += Math.max(0, p.cost - p.qty * p.stop * (1 - FEE));
+  for (const [sym, p] of Object.entries(state.futures || {})) if (sym !== GOLD && p.stop) r[p.side] += Math.max(0, dir(p) * (p.entry - p.stop) * p.qty + p.qty * p.stop * FUT_FEE);
+  return r;
+}
 
 // Closes `frac` of a futures position at `price` and logs it; extra = {reason, trigger?}.
 function closeFutures(state, symbol, frac, price, extra) {
@@ -233,6 +246,6 @@ function value(state, tk, ftk = {}) {
 }
 
 module.exports = {GOLD, START_CASH, FEE, MIN_VOLUME, MAX_WEIGHT, MAX_TRADES_PER_RUN, FUT_FEE, MIN_FUT_VOLUME, MAX_LEVERAGE, MAX_FUT_MARGIN,
-  RISK_PER_TRADE, LOSS_STREAK, MIN_REWARD_RISK, ATR_STOP, DAILY_LOSS_STOP,
+  RISK_PER_TRADE, LOSS_STREAK, MIN_REWARD_RISK, ATR_STOP, DAILY_LOSS_STOP, SIDE_RISK, BOUNCE_NO_SHORT,
   loadState, saveState, readLog, appendLog, bitget, tickers, futuresTickers, recentChanges, hourlyAtr, btcTrend, record, dayStart, btcAt,
-  liqPrice, sellSpot, closeFutures, settle, value};
+  liqPrice, openRisk, sellSpot, closeFutures, settle, value};

@@ -17,14 +17,15 @@
 //   - a stop at least 1.5× the coin's average hourly range away (and, for futures, before the liquidation price),
 //   - a take-profit at least 1.5× as far as the stop,
 //   - size such that hitting the stop loses ≤1.5% of the portfolio (half after 3 losing exits in a row),
-//   - no buying or going long while BTC's daily trend is down (gold excepted),
+//   - no buying or going long while BTC's daily trend is down, and no shorting while BTC is ≥5% above its 3-day low,
+//   - all crypto positions on the same side together lose ≤2.5% if every stop is hit (gold is exempt from these three),
 //   - no new entries once the portfolio is 5% down on the day, and no adding to a losing spot position.
 // Spot coins need ≥10M USDT of 24h volume (gold ≥1M).
 // Stops, take-profits, funding and liquidation are applied by settle (lib.js) every run.
 const {GOLD, FEE, MIN_VOLUME, MAX_WEIGHT, MAX_TRADES_PER_RUN, FUT_FEE, MIN_FUT_VOLUME, MAX_LEVERAGE, MAX_FUT_MARGIN,
-  RISK_PER_TRADE, LOSS_STREAK, MIN_REWARD_RISK, ATR_STOP, DAILY_LOSS_STOP,
+  RISK_PER_TRADE, LOSS_STREAK, MIN_REWARD_RISK, ATR_STOP, DAILY_LOSS_STOP, SIDE_RISK, BOUNCE_NO_SHORT,
   loadState, saveState, readLog, appendLog, tickers, futuresTickers, hourlyAtr, btcTrend, record, dayStart,
-  liqPrice, sellSpot, closeFutures, settle, value} = require('./lib');
+  liqPrice, openRisk, sellSpot, closeFutures, settle, value} = require('./lib');
 
 const fail = msg => { console.error('REJECTED: ' + msg); process.exit(1); };
 const TRADES = ['buy', 'sell', 'long', 'short', 'close'];
@@ -95,9 +96,10 @@ const fmt = v => (+v).toPrecision(6);
   const day = dayStart(state, v.total);
   saveState(state);
   if (v.total < day.total * (1 - DAILY_LOSS_STOP)) fail(`今天已经亏了 ${((1 - v.total / day.total) * 100).toFixed(1)}%（从 ${day.total.toFixed(2)} 到 ${v.total.toFixed(2)}），今天不再开新仓`);
-  if (long && symbol !== GOLD) {
+  if (symbol !== GOLD) {
     const btc = await btcTrend();
-    if (btc.trend === 'down') fail(`比特币日线是下跌趋势（${fmt(btc.close)} 低于正在下降的 20 日均线 ${fmt(btc.sma20)}），不做多；可以做空弱势币，或等比特币站回 20 日均线`);
+    if (long && btc.trend === 'down') fail(`比特币日线是下跌趋势（${fmt(btc.close)} 低于正在下降的 20 日均线 ${fmt(btc.sma20)}），不做多；可以做空弱势币，或等比特币站回 20 日均线`);
+    if (!long && btc.bounce >= BOUNCE_NO_SHORT) fail(`比特币已经从 3 天低点 ${fmt(btc.low3)} 反弹了 ${(btc.bounce * 100).toFixed(1)}%（≥${BOUNCE_NO_SHORT * 100}%），大跌后的反弹里追空容易被打止损；等比特币跌回低点附近或创新低再空`);
   }
   // Gold tracks the metal, not a thin small cap, so it keeps the old 1M floor; XAUT often trades under 10M a day.
   const minVolume = futures ? MIN_FUT_VOLUME : symbol === GOLD ? 1e6 : MIN_VOLUME;
@@ -111,6 +113,10 @@ const fmt = v => (+v).toPrecision(6);
   if (loss > budget) {
     const most = budget / (risk / price + (futures ? FUT_FEE : FEE) * 2) / leverage;
     fail(`打到止损会亏 ${loss.toFixed(2)} USDT，超过上限 ${budget.toFixed(2)}（组合的 ${(budget / v.total * 100).toFixed(2)}%${streak >= LOSS_STREAK ? `，已连亏 ${streak} 笔所以减半` : ''}）；${futures ? '保证金' : '金额'}最多 ${most.toFixed(2)} USDT`);
+  }
+  if (symbol !== GOLD) {
+    const side = long ? 'long' : 'short', open = openRisk(state)[side], cap = v.total * SIDE_RISK;
+    if (open + loss > cap) fail(`同方向（${long ? '做多' : '做空'}）的仓位打到止损已经会亏 ${open.toFixed(2)} USDT，加上这笔 ${loss.toFixed(2)} 超过组合的 ${SIDE_RISK * 100}%（${cap.toFixed(2)}）；比特币和山寨币通常一起涨跌，这笔打到止损最多只能亏 ${Math.max(0, cap - open).toFixed(2)} USDT`);
   }
 
   if (!futures) {
